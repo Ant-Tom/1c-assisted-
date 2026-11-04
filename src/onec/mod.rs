@@ -7,6 +7,12 @@ use chrono::NaiveDate;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
+pub mod http;
+pub mod mock;
+
+pub use http::HttpOneC;
+pub use mock::MockOneC;
+
 /// Денежная сумма в копейках. Наружу сериализуется строкой `"1234.56"`,
 /// чтобы не терять точность на f64.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
