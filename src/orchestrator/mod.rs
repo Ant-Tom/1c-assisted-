@@ -177,6 +177,9 @@ impl Orchestrator {
         let request_id = Uuid::new_v4().to_string();
         let mut run = RunState::default();
         let result = self.process(&req, &request_id, &mut run).await;
+        if let Err(err) = &result {
+            tracing::warn!(%request_id, code = err.code(), error = %err, "запрос завершился ошибкой");
+        }
         self.write_audit(&req, &request_id, &run, &result, started.elapsed())
             .await;
         result
