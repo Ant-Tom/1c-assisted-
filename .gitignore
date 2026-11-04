@@ -1,0 +1,7 @@
+/target
+.env
+users.toml
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm

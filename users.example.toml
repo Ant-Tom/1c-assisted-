@@ -1,0 +1,15 @@
+# Сопоставление пользователя с ролью. Скопируйте в users.toml.
+# Роли: viewer (поиск контрагентов), manager (+ неоплаченные счета),
+#       accountant (все функции чтения, включая сальдо и обороты).
+
+[[users]]
+id = "ivanova"
+role = "accountant"
+
+[[users]]
+id = "petrov"
+role = "manager"
+
+[[users]]
+id = "sidorova"
+role = "viewer"
