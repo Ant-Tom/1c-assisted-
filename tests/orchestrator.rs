@@ -5,13 +5,16 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use onec_assistant::audit::AuditLog;
 use onec_assistant::auth::{Role, UserIdentity};
 use onec_assistant::config::Limits;
 use onec_assistant::llm::mock::MockRequest;
 use onec_assistant::llm::{ChatRole, MockProvider, MockStep, Reply, ToolCall};
 use onec_assistant::onec::mock::INJECTION_COUNTERPARTY_NAME;
 use onec_assistant::onec::MockOneC;
-use onec_assistant::orchestrator::{ChatRequest, Orchestrator, OrchestratorError};
+use onec_assistant::orchestrator::{
+    ChatRequest, Orchestrator, OrchestratorError, OrchestratorSettings,
+};
 use onec_assistant::tools::onec_registry;
 
 struct Harness {
@@ -25,7 +28,15 @@ fn harness_with(llm: MockProvider, onec: MockOneC, limits: Limits) -> Harness {
     let onec = Arc::new(onec);
     let tools = Arc::new(onec_registry(onec.clone()).unwrap());
     Harness {
-        orchestrator: Orchestrator::new(llm.clone(), tools, limits),
+        orchestrator: Orchestrator::new(
+            llm.clone(),
+            tools,
+            AuditLog::open_in_memory().unwrap(),
+            OrchestratorSettings {
+                limits,
+                log_questions: true,
+            },
+        ),
         llm,
         onec,
     }

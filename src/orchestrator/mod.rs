@@ -4,12 +4,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Local;
+use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::audit::{AuditLog, AuditRecord};
 use crate::auth::UserIdentity;
 use crate::config::Limits;
 use crate::llm::{LlmError, LlmProvider, Message, Reply, ToolCall};
@@ -47,6 +48,7 @@ pub struct SourceRef {
 /// Факт вызова функции: для источников и журнала.
 #[derive(Debug, Clone)]
 pub struct ToolInvocation {
+    pub ts: DateTime<Utc>,
     pub function: String,
     pub arguments: Value,
     pub status: String,
@@ -117,22 +119,47 @@ struct RunState {
     invocations: Vec<ToolInvocation>,
     /// id контрагентов из поисков, вернувших нескольких кандидатов в этом запросе.
     ambiguous_ids: HashSet<String>,
+    conversation_id: Option<String>,
+}
+
+/// Настройки оркестратора.
+#[derive(Debug, Clone, Copy)]
+pub struct OrchestratorSettings {
+    pub limits: Limits,
+    /// Хранить ли текст вопроса в журнале.
+    pub log_questions: bool,
+}
+
+impl Default for OrchestratorSettings {
+    fn default() -> Self {
+        Self {
+            limits: Limits::default(),
+            log_questions: true,
+        }
+    }
 }
 
 pub struct Orchestrator {
     llm: Arc<dyn LlmProvider>,
     tools: Arc<ToolRegistry>,
+    audit: AuditLog,
     conversations: ConversationStore,
-    limits: Limits,
+    settings: OrchestratorSettings,
 }
 
 impl Orchestrator {
-    pub fn new(llm: Arc<dyn LlmProvider>, tools: Arc<ToolRegistry>, limits: Limits) -> Self {
+    pub fn new(
+        llm: Arc<dyn LlmProvider>,
+        tools: Arc<ToolRegistry>,
+        audit: AuditLog,
+        settings: OrchestratorSettings,
+    ) -> Self {
         Self {
             llm,
             tools,
+            audit,
             conversations: ConversationStore::default(),
-            limits,
+            settings,
         }
     }
 
@@ -140,21 +167,42 @@ impl Orchestrator {
         self.llm.model_name()
     }
 
+    pub fn audit_log(&self) -> &AuditLog {
+        &self.audit
+    }
+
+    /// Обрабатывает вопрос и пишет журнал (в том числе для отклонённых запросов).
     pub async fn handle(&self, req: ChatRequest) -> Result<ChatResponse, OrchestratorError> {
+        let started = Instant::now();
+        let request_id = Uuid::new_v4().to_string();
+        let mut run = RunState::default();
+        let result = self.process(&req, &request_id, &mut run).await;
+        self.write_audit(&req, &request_id, &run, &result, started.elapsed())
+            .await;
+        result
+    }
+
+    async fn process(
+        &self,
+        req: &ChatRequest,
+        request_id: &str,
+        run: &mut RunState,
+    ) -> Result<ChatResponse, OrchestratorError> {
+        let limits = self.settings.limits;
         let question = req.message.trim();
         if question.is_empty() {
             return Err(OrchestratorError::EmptyMessage);
         }
-        if question.chars().count() > self.limits.max_message_chars {
+        if question.chars().count() > limits.max_message_chars {
             return Err(OrchestratorError::MessageTooLong {
-                max: self.limits.max_message_chars,
+                max: limits.max_message_chars,
             });
         }
 
         let (conversation_id, history) = self
             .conversations
             .load(req.conversation_id.as_deref(), &req.user.user_id)?;
-        let request_id = Uuid::new_v4().to_string();
+        run.conversation_id = Some(conversation_id.clone());
 
         let mut messages = Vec::with_capacity(history.len() + 2);
         messages.push(Message::system(prompt::system_prompt(
@@ -163,10 +211,9 @@ impl Orchestrator {
         messages.extend(history);
         messages.push(Message::user(question));
 
-        let mut run = RunState::default();
         let outcome = tokio::time::timeout(
-            self.limits.request_timeout,
-            self.run_loop(&req.user, &request_id, &mut messages, &mut run),
+            limits.request_timeout,
+            self.run_loop(&req.user, request_id, &mut messages, run),
         )
         .await;
         let text = match outcome {
@@ -196,12 +243,80 @@ impl Orchestrator {
 
         let sources: Vec<SourceRef> = run.invocations.iter().map(ToolInvocation::source).collect();
         Ok(ChatResponse {
-            request_id,
+            request_id: request_id.to_string(),
             conversation_id,
             answer: format!("{}\n\n{}", text.trim(), sources_footer(&sources)),
             sources,
             warnings,
         })
+    }
+
+    async fn write_audit(
+        &self,
+        req: &ChatRequest,
+        request_id: &str,
+        run: &RunState,
+        result: &Result<ChatResponse, OrchestratorError>,
+        elapsed: Duration,
+    ) {
+        let question = self
+            .settings
+            .log_questions
+            .then(|| req.message.trim().to_string());
+        let model = Some(self.llm.model_name().to_string());
+        let role = Some(req.user.role.as_str().to_string());
+        let base = AuditRecord {
+            ts: Utc::now(),
+            request_id: request_id.to_string(),
+            conversation_id: run.conversation_id.clone(),
+            user_id: req.user.user_id.clone(),
+            role,
+            question: None,
+            function_name: None,
+            arguments: None,
+            status: String::new(),
+            result_size: None,
+            model,
+            duration_ms: 0,
+            error: None,
+        };
+
+        let mut records: Vec<AuditRecord> = run
+            .invocations
+            .iter()
+            .map(|inv| AuditRecord {
+                ts: inv.ts,
+                function_name: Some(inv.function.clone()),
+                arguments: Some(inv.arguments.to_string()),
+                status: inv.status.clone(),
+                result_size: Some(saturating_i64(inv.result_size as u128)),
+                duration_ms: saturating_i64(inv.duration.as_millis()),
+                error: inv.error.clone(),
+                ..base.clone()
+            })
+            .collect();
+
+        let (status, result_size, error) = match result {
+            Ok(resp) => (
+                "ok".to_string(),
+                Some(saturating_i64(resp.answer.len() as u128)),
+                (!resp.warnings.is_empty()).then(|| resp.warnings.join("; ")),
+            ),
+            Err(err) => (err.code().to_string(), None, Some(err.to_string())),
+        };
+        records.push(AuditRecord {
+            question,
+            status,
+            result_size,
+            duration_ms: saturating_i64(elapsed.as_millis()),
+            error,
+            ..base
+        });
+
+        if let Err(err) = self.audit.write(records).await {
+            // Сбой журнала не роняет ответ пользователю, но громко логируется.
+            tracing::error!(%request_id, error = %err, "не удалось записать журнал");
+        }
     }
 
     async fn run_loop(
@@ -212,7 +327,7 @@ impl Orchestrator {
         run: &mut RunState,
     ) -> Result<String, OrchestratorError> {
         let specs = self.tools.specs_for(user.role);
-        for iteration in 0..self.limits.max_iterations {
+        for iteration in 0..self.settings.limits.max_iterations {
             let reply = self.llm.chat(messages, &specs).await?;
             let calls = match reply {
                 Reply::Text(text) => {
@@ -233,11 +348,11 @@ impl Orchestrator {
             tracing::debug!(%request_id, iteration, calls = calls.len(), "модель запросила вызовы");
             messages.push(Message::assistant_tool_calls(calls.clone()));
             for (index, call) in calls.iter().enumerate() {
-                let content = if index < self.limits.max_tool_calls_per_iteration {
+                let content = if index < self.settings.limits.max_tool_calls_per_iteration {
                     self.execute_call(user, request_id, call, run).await
                 } else {
                     let err = ToolError::TooManyCalls {
-                        limit: self.limits.max_tool_calls_per_iteration,
+                        limit: self.settings.limits.max_tool_calls_per_iteration,
                     };
                     self.record(run, call, Err(&err), 0, Duration::ZERO, request_id);
                     err.to_model_json().to_string()
@@ -246,7 +361,7 @@ impl Orchestrator {
             }
         }
         Err(OrchestratorError::IterationLimit {
-            limit: self.limits.max_iterations,
+            limit: self.settings.limits.max_iterations,
         })
     }
 
@@ -274,7 +389,7 @@ impl Orchestrator {
             Err(ToolError::AmbiguousCounterparty)
         } else {
             match tokio::time::timeout(
-                self.limits.tool_timeout,
+                self.settings.limits.tool_timeout,
                 self.tools.execute(user.role, call),
             )
             .await
@@ -347,6 +462,7 @@ impl Orchestrator {
             "вызов функции"
         );
         run.invocations.push(ToolInvocation {
+            ts: Utc::now(),
             function: call.name.clone(),
             arguments,
             status,
@@ -355,6 +471,10 @@ impl Orchestrator {
             duration,
         });
     }
+}
+
+fn saturating_i64(v: u128) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
 }
 
 /// Некоторые серверы не присылают id вызова или повторяют его: делаем id уникальными,
