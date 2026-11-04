@@ -55,15 +55,62 @@ pub enum LlmBackend {
     GigaChat,
 }
 
+/// Допустимые значения scope для получения токена GigaChat.
+pub const GIGACHAT_SCOPES: &[&str] =
+    &["GIGACHAT_API_PERS", "GIGACHAT_API_B2B", "GIGACHAT_API_CORP"];
+
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     pub backend: LlmBackend,
-    /// Базовый URL, например `http://127.0.0.1:8080/v1` для llama-server.
+    /// Базовый URL API:
+    /// - openai_compatible: до `/chat/completions`, например `http://127.0.0.1:8080/v1`;
+    /// - yandexgpt: до `/completion`, по умолчанию `https://ai.api.cloud.yandex.net/foundationModels/v1`;
+    /// - gigachat: до `/chat/completions`, по умолчанию `https://api.giga.chat/v1`.
     pub base_url: String,
+    /// openai_compatible: Bearer-ключ; yandexgpt: API-ключ сервисного аккаунта (`Api-Key`);
+    /// gigachat: ключ авторизации, которым получается токен доступа.
     pub api_key: Option<Secret>,
+    /// Имя модели. Для yandexgpt — часть modelUri после каталога (`yandexgpt/latest`)
+    /// или полный `gpt://...`.
     pub model: String,
     pub http_timeout: Duration,
     pub temperature: f32,
+    pub max_tokens: u32,
+    /// yandexgpt: идентификатор каталога (для modelUri и заголовка `x-folder-id`).
+    pub folder_id: Option<String>,
+    /// gigachat: адрес получения токена.
+    pub oauth_url: String,
+    /// gigachat: scope токена.
+    pub scope: String,
+    /// Дополнительные корневые сертификаты (PEM), например НУЦ Минцифры.
+    pub ca_cert_path: Option<PathBuf>,
+}
+
+impl LlmConfig {
+    /// Конфигурация с умолчаниями для провайдера.
+    pub fn for_backend(backend: LlmBackend) -> Self {
+        let (base_url, model) = match backend {
+            LlmBackend::OpenAiCompatible => ("http://127.0.0.1:8080/v1", "local-model"),
+            LlmBackend::YandexGpt => (
+                "https://ai.api.cloud.yandex.net/foundationModels/v1",
+                "yandexgpt/latest",
+            ),
+            LlmBackend::GigaChat => ("https://api.giga.chat/v1", "GigaChat-2-Pro"),
+        };
+        Self {
+            backend,
+            base_url: base_url.to_string(),
+            api_key: None,
+            model: model.to_string(),
+            http_timeout: Duration::from_secs(60),
+            temperature: 0.0,
+            max_tokens: 2000,
+            folder_id: None,
+            oauth_url: "https://ngw.devices.sberbank.ru:9443/api/v2/oauth".to_string(),
+            scope: "GIGACHAT_API_PERS".to_string(),
+            ca_cert_path: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,17 +241,21 @@ impl Config {
             },
         };
 
-        let api_key = env.optional("LLM_API_KEY").map(Secret::new);
-        let temperature: f32 = env.parse_or("LLM_TEMPERATURE", 0.0f32)?;
-
+        let defaults_llm = LlmConfig::for_backend(llm_backend);
         let llm = LlmConfig {
             backend: llm_backend,
-            base_url: env.string_or("LLM_BASE_URL", "http://127.0.0.1:8080/v1"),
-            api_key,
-            model: env.string_or("LLM_MODEL", "local-model"),
+            base_url: env.string_or("LLM_BASE_URL", &defaults_llm.base_url),
+            api_key: env.optional("LLM_API_KEY").map(Secret::new),
+            model: env.string_or("LLM_MODEL", &defaults_llm.model),
             http_timeout: Duration::from_secs(env.parse_or("LLM_TIMEOUT_SECS", 60u64)?),
-            temperature,
+            temperature: env.parse_or("LLM_TEMPERATURE", 0.0f32)?,
+            max_tokens: env.parse_positive_or("LLM_MAX_TOKENS", defaults_llm.max_tokens)?,
+            folder_id: env.optional("LLM_FOLDER_ID"),
+            oauth_url: env.string_or("GIGACHAT_OAUTH_URL", &defaults_llm.oauth_url),
+            scope: env.string_or("GIGACHAT_SCOPE", &defaults_llm.scope),
+            ca_cert_path: env.optional("LLM_CA_CERT_PATH").map(PathBuf::from),
         };
+        validate_llm(&llm)?;
 
         let limits = Limits {
             max_iterations: env.parse_positive_or("MAX_ITERATIONS", defaults.max_iterations)?,
@@ -244,6 +295,53 @@ impl Config {
         }
         out
     }
+}
+
+/// Проверки, которые лучше сделать при старте, чем на первом запросе.
+fn validate_llm(llm: &LlmConfig) -> Result<(), ConfigError> {
+    if !(0.0..=2.0).contains(&llm.temperature) {
+        return Err(ConfigError::Invalid {
+            name: "LLM_TEMPERATURE",
+            reason: "ожидается число от 0 до 2".into(),
+        });
+    }
+    let has_key = llm.api_key.as_ref().is_some_and(|k| !k.is_empty());
+    match llm.backend {
+        LlmBackend::OpenAiCompatible => {}
+        LlmBackend::YandexGpt => {
+            if !has_key {
+                return Err(ConfigError::Missing {
+                    name: "LLM_API_KEY",
+                });
+            }
+            if llm.folder_id.is_none() && !llm.model.starts_with("gpt://") {
+                return Err(ConfigError::Invalid {
+                    name: "LLM_FOLDER_ID",
+                    reason: "для yandexgpt нужен идентификатор каталога или LLM_MODEL вида gpt://<каталог>/<модель>".into(),
+                });
+            }
+            if llm.temperature > 1.0 {
+                return Err(ConfigError::Invalid {
+                    name: "LLM_TEMPERATURE",
+                    reason: "для yandexgpt допустимо от 0 до 1".into(),
+                });
+            }
+        }
+        LlmBackend::GigaChat => {
+            if !has_key {
+                return Err(ConfigError::Missing {
+                    name: "LLM_API_KEY",
+                });
+            }
+            if !GIGACHAT_SCOPES.contains(&llm.scope.as_str()) {
+                return Err(ConfigError::Invalid {
+                    name: "GIGACHAT_SCOPE",
+                    reason: format!("ожидается одно из {}", GIGACHAT_SCOPES.join(", ")),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 struct Env<F> {
@@ -354,6 +452,36 @@ mod tests {
         assert!(!dump.contains("super-secret-1c"));
         assert!(!dump.contains("sk-very-secret"));
         assert_eq!(cfg.secrets().len(), 2);
+    }
+
+    #[test]
+    fn provider_specific_defaults_and_checks() {
+        assert!(
+            config_from(&[("LLM_BACKEND", "yandexgpt")]).is_err(),
+            "нужен ключ"
+        );
+        assert!(
+            config_from(&[("LLM_BACKEND", "yandexgpt"), ("LLM_API_KEY", "k")]).is_err(),
+            "нужен каталог"
+        );
+        let ya = config_from(&[
+            ("LLM_BACKEND", "yandexgpt"),
+            ("LLM_API_KEY", "k"),
+            ("LLM_FOLDER_ID", "b1gfolder"),
+        ])
+        .unwrap();
+        assert_eq!(ya.llm.model, "yandexgpt/latest");
+        assert!(ya.llm.base_url.contains("foundationModels/v1"));
+
+        let giga = config_from(&[("LLM_BACKEND", "gigachat"), ("LLM_API_KEY", "k")]).unwrap();
+        assert_eq!(giga.llm.base_url, "https://api.giga.chat/v1");
+        assert_eq!(giga.llm.scope, "GIGACHAT_API_PERS");
+        assert!(config_from(&[
+            ("LLM_BACKEND", "gigachat"),
+            ("LLM_API_KEY", "k"),
+            ("GIGACHAT_SCOPE", "ADMIN")
+        ])
+        .is_err());
     }
 
     #[test]

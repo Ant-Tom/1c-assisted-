@@ -59,14 +59,12 @@ async fn start(seen: Seen) -> String {
 }
 
 fn llm_config(base_url: String, key: &str) -> LlmConfig {
-    LlmConfig {
-        backend: LlmBackend::OpenAiCompatible,
-        base_url,
-        api_key: Some(Secret::new(key)),
-        model: "qwen-test".into(),
-        http_timeout: Duration::from_secs(5),
-        temperature: 0.0,
-    }
+    let mut cfg = LlmConfig::for_backend(LlmBackend::OpenAiCompatible);
+    cfg.base_url = base_url;
+    cfg.api_key = Some(Secret::new(key));
+    cfg.model = "qwen-test".into();
+    cfg.http_timeout = Duration::from_secs(5);
+    cfg
 }
 
 #[tokio::test]

@@ -7,8 +7,7 @@ use onec_assistant::audit::AuditLog;
 use onec_assistant::auth::FileIdentityResolver;
 use onec_assistant::config::{Config, LlmBackend, OneCBackend};
 use onec_assistant::error::AppError;
-use onec_assistant::llm::openai::OpenAiCompatible;
-use onec_assistant::llm::{LlmError, LlmProvider};
+use onec_assistant::llm::{GigaChat, LlmProvider, OpenAiCompatible, YandexGpt};
 use onec_assistant::onec::{HttpOneC, MockOneC, OneCClient};
 use onec_assistant::orchestrator::{Orchestrator, OrchestratorSettings};
 use onec_assistant::tools::onec_registry;
@@ -49,12 +48,10 @@ async fn run() -> Result<(), AppError> {
         }
     };
 
-    // Заготовки YandexGPT и GigaChat не запускаем: лучше упасть при старте,
-    // чем отвечать 502 на каждый запрос.
     let llm: Arc<dyn LlmProvider> = match config.llm.backend {
         LlmBackend::OpenAiCompatible => Arc::new(OpenAiCompatible::new(&config.llm)?),
-        LlmBackend::YandexGpt => return Err(LlmError::NotImplemented("YandexGPT").into()),
-        LlmBackend::GigaChat => return Err(LlmError::NotImplemented("GigaChat").into()),
+        LlmBackend::YandexGpt => Arc::new(YandexGpt::new(&config.llm)?),
+        LlmBackend::GigaChat => Arc::new(GigaChat::new(&config.llm)?),
     };
 
     let tools = Arc::new(onec_registry(onec)?);
@@ -77,6 +74,7 @@ async fn run() -> Result<(), AppError> {
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(
         addr = %config.bind_addr,
+        llm = ?config.llm.backend,
         model = %config.llm.model,
         onec = ?config.onec.backend,
         users = identity.len(),

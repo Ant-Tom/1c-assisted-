@@ -8,11 +8,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{ChatRole, LlmError, LlmProvider, Message, Reply, ToolCall, ToolSpec};
+use super::{
+    arguments_to_string, http_client, map_transport, read_body, ChatRole, LlmError, LlmProvider,
+    Message, Reply, ToolCall, ToolSpec,
+};
 use crate::config::{LlmConfig, Secret};
-
-/// Сколько символов тела ошибки сохраняем в тексте ошибки.
-const MAX_ERROR_BODY_CHARS: usize = 500;
 
 pub struct OpenAiCompatible {
     client: reqwest::Client,
@@ -24,10 +24,7 @@ pub struct OpenAiCompatible {
 
 impl OpenAiCompatible {
     pub fn new(config: &LlmConfig) -> Result<Self, LlmError> {
-        let client = reqwest::Client::builder()
-            .timeout(config.http_timeout)
-            .build()
-            .map_err(|e| LlmError::Transport(e.without_url().to_string()))?;
+        let client = http_client(config)?;
         Ok(Self {
             client,
             endpoint: format!("{}/chat/completions", config.base_url.trim_end_matches('/')),
@@ -51,23 +48,8 @@ impl LlmProvider for OpenAiCompatible {
             request = request.bearer_auth(key.expose());
         }
         let response = request.send().await.map_err(map_transport)?;
-        let status = response.status();
-        let text = response.text().await.map_err(map_transport)?;
-        if !status.is_success() {
-            return Err(LlmError::Status {
-                status: status.as_u16(),
-                body: text.chars().take(MAX_ERROR_BODY_CHARS).collect(),
-            });
-        }
+        let text = read_body(response).await?;
         parse_response(&text)
-    }
-}
-
-fn map_transport(err: reqwest::Error) -> LlmError {
-    if err.is_timeout() {
-        LlmError::Timeout
-    } else {
-        LlmError::Transport(err.without_url().to_string())
     }
 }
 
@@ -228,11 +210,8 @@ pub fn parse_response(text: &str) -> Result<Reply, LlmError> {
         .map(|c| ToolCall {
             id: c.id.unwrap_or_default(),
             name: c.function.name,
-            arguments: match c.function.arguments {
-                Some(Value::String(s)) => s,
-                Some(Value::Null) | None => String::new(),
-                Some(other) => other.to_string(),
-            },
+            arguments: arguments_to_string(c.function.arguments),
+            state: None,
         })
         .collect();
     if !calls.is_empty() {

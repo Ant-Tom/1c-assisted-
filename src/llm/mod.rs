@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::config::LlmConfig;
+
 pub mod gigachat;
 pub mod mock;
 pub mod openai;
@@ -33,6 +35,10 @@ pub struct ToolCall {
     /// Разбор и валидация выполняются в реестре функций, чтобы кривой JSON
     /// превращался в ошибку для модели, а не в падение.
     pub arguments: String,
+    /// Служебное состояние провайдера, которое нужно вернуть вместе с вызовом
+    /// (например, `functions_state_id` у GigaChat). Оркестратор его не трогает.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 
 impl ToolCall {
@@ -41,6 +47,7 @@ impl ToolCall {
             id: id.into(),
             name: name.into(),
             arguments: arguments.to_string(),
+            state: None,
         }
     }
 
@@ -54,6 +61,7 @@ impl ToolCall {
             id: id.into(),
             name: name.into(),
             arguments: arguments.into(),
+            state: None,
         }
     }
 }
@@ -136,10 +144,73 @@ pub enum LlmError {
     Status { status: u16, body: String },
     #[error("неожиданный ответ модели: {0}")]
     InvalidResponse(String),
-    #[error("провайдер {0} не реализован: формат API нужно сверить с актуальной документацией")]
-    NotImplemented(&'static str),
     #[error("сценарий MockProvider исчерпан")]
     ScriptExhausted,
+    #[error("ошибка конфигурации провайдера: {0}")]
+    Configuration(String),
+}
+
+/// Сколько символов тела ошибки провайдера сохраняем в тексте ошибки.
+pub(crate) const MAX_ERROR_BODY_CHARS: usize = 500;
+
+/// HTTP-клиент для провайдера: таймаут и, при необходимости, дополнительные
+/// корневые сертификаты (например, НУЦ Минцифры для GigaChat).
+pub(crate) fn http_client(config: &LlmConfig) -> Result<reqwest::Client, LlmError> {
+    let mut builder = reqwest::Client::builder().timeout(config.http_timeout);
+    if let Some(path) = &config.ca_cert_path {
+        let pem = std::fs::read(path).map_err(|e| {
+            LlmError::Configuration(format!(
+                "не удалось прочитать сертификат {}: {e}",
+                path.display()
+            ))
+        })?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+            LlmError::Configuration(format!("неверный PEM {}: {e}", path.display()))
+        })?;
+        builder = builder.tls_certs_merge(certs);
+    }
+    builder
+        .build()
+        .map_err(|e| LlmError::Configuration(e.without_url().to_string()))
+}
+
+/// Ошибка транспорта без URL (в нём могут быть параметры).
+pub(crate) fn map_transport(err: reqwest::Error) -> LlmError {
+    if err.is_timeout() {
+        LlmError::Timeout
+    } else {
+        LlmError::Transport(err.without_url().to_string())
+    }
+}
+
+/// Читает тело ответа; при неуспешном статусе возвращает типизированную ошибку.
+pub(crate) async fn read_body(response: reqwest::Response) -> Result<String, LlmError> {
+    let status = response.status();
+    let text = response.text().await.map_err(map_transport)?;
+    if !status.is_success() {
+        return Err(LlmError::Status {
+            status: status.as_u16(),
+            body: text.chars().take(MAX_ERROR_BODY_CHARS).collect(),
+        });
+    }
+    Ok(text)
+}
+
+/// Аргументы вызова как JSON-объект (для провайдеров, которые ждут объект, а не строку).
+pub(crate) fn arguments_object(raw: &str) -> Value {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(v @ Value::Object(_)) => v,
+        _ => Value::Object(Default::default()),
+    }
+}
+
+/// Аргументы из ответа провайдера: объект или уже строка.
+pub(crate) fn arguments_to_string(value: Option<Value>) -> String {
+    match value {
+        Some(Value::String(s)) => s,
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
 }
 
 #[async_trait]

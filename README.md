@@ -50,6 +50,7 @@ curl -s http://127.0.0.1:3000/health
 curl -s -X POST http://127.0.0.1:3000/chat -H 'content-type: application/json' -d '{"user_id":"ivanova","message":"Какое сальдо с Вектором на 1 ноября?"}'
 ```
 
+Для YandexGPT или GigaChat задайте `LLM_BACKEND` и ключи (см. «Провайдеры моделей»).
 По умолчанию `ONEC_BACKEND=mock`: ответы строятся на тестовых данных
 (см. «Тестовые данные»).
 
@@ -63,12 +64,17 @@ curl -s -X POST http://127.0.0.1:3000/chat -H 'content-type: application/json' -
 | `USERS_FILE` | `users.toml` | Пользователи и роли |
 | `AUDIT_DB_PATH` | `audit.sqlite` | Файл журнала |
 | `LOG_QUESTIONS` | `true` | `false` — текст вопроса в журнал не пишется |
-| `LLM_BACKEND` | `openai_compatible` | `openai_compatible`; `yandexgpt` и `gigachat` — заготовки, сервис с ними не стартует |
-| `LLM_BASE_URL` | `http://127.0.0.1:8080/v1` | База до `/chat/completions` |
-| `LLM_MODEL` | `local-model` | Имя модели (идёт в запрос и в журнал) |
-| `LLM_API_KEY` | — | Bearer-ключ, если нужен |
+| `LLM_BACKEND` | `openai_compatible` | `openai_compatible`, `yandexgpt` или `gigachat` |
+| `LLM_BASE_URL` | зависит от провайдера | См. «Провайдеры моделей» |
+| `LLM_MODEL` | `local-model` / `yandexgpt/latest` / `GigaChat-2-Pro` | Имя модели (идёт в запрос и в журнал) |
+| `LLM_API_KEY` | — | openai_compatible: Bearer-ключ (необязательно); yandexgpt: API-ключ сервисного аккаунта; gigachat: ключ авторизации |
 | `LLM_TIMEOUT_SECS` | `60` | Таймаут одного HTTP-запроса к модели |
-| `LLM_TEMPERATURE` | `0` | Температура |
+| `LLM_TEMPERATURE` | `0` | Температура (yandexgpt: 0–1; gigachat: 0 — не передавать) |
+| `LLM_MAX_TOKENS` | `2000` | Лимит токенов ответа (yandexgpt, gigachat) |
+| `LLM_FOLDER_ID` | — | yandexgpt: идентификатор каталога |
+| `GIGACHAT_SCOPE` | `GIGACHAT_API_PERS` | gigachat: `GIGACHAT_API_PERS`, `GIGACHAT_API_B2B` или `GIGACHAT_API_CORP` |
+| `GIGACHAT_OAUTH_URL` | `https://ngw.devices.sberbank.ru:9443/api/v2/oauth` | gigachat: получение токена |
+| `LLM_CA_CERT_PATH` | — | Дополнительные корневые сертификаты (PEM), например НУЦ Минцифры |
 | `ONEC_BACKEND` | `mock` | `mock` или `http` |
 | `ONEC_BASE_URL` | — | Обязателен при `http` |
 | `ONEC_USER`, `ONEC_PASSWORD` | — | Basic-аутентификация HTTP-сервиса 1С |
@@ -79,6 +85,59 @@ curl -s -X POST http://127.0.0.1:3000/chat -H 'content-type: application/json' -
 | `REQUEST_TIMEOUT_SECS` | `60` | Общий таймаут обработки вопроса |
 | `MAX_MESSAGE_CHARS` | `4000` | Максимальная длина вопроса |
 | `RUST_LOG` | `info` | Уровень логов |
+
+## Провайдеры моделей
+
+Все провайдеры реализуют один трейт `LlmProvider`; цикл вызова функций, права и журнал
+от провайдера не зависят. Конфигурация проверяется при старте: без ключа, каталога
+(YandexGPT) или с неверным scope (GigaChat) сервис не запустится.
+
+### OpenAI-совместимый сервер (`openai_compatible`)
+
+llama-server, vLLM и подобные: `POST {LLM_BASE_URL}/chat/completions` с `tools`.
+Учтены расхождения серверов: отсутствующий `id` вызова и `arguments` объектом вместо строки.
+
+### YandexGPT (`yandexgpt`)
+
+Нативный REST API Yandex AI Studio: `POST {LLM_BASE_URL}/completion`
+(по умолчанию `https://ai.api.cloud.yandex.net/foundationModels/v1/completion`).
+
+- Аутентификация: `Authorization: Api-Key <LLM_API_KEY>` (API-ключ сервисного аккаунта
+  с ролью `ai.languageModels.user`), заголовок `x-folder-id` при заданном `LLM_FOLDER_ID`.
+- Модель: `modelUri = gpt://<LLM_FOLDER_ID>/<LLM_MODEL>` или полный `gpt://...` в `LLM_MODEL`.
+- Вызовы функций приходят в `toolCallList` без id; результаты отправляются сообщением
+  `role: user` с `toolResultList` и сопоставляются по имени функции.
+- Ответ принимается и в обёртке `result` (как в руководстве), и без неё (как в справочнике).
+
+Сверено с документацией ([вызов функции](https://aistudio.yandex.ru/docs/ru/ai-studio/operations/generation/function-call),
+[справочник Completion](https://aistudio.yandex.ru/docs/ru/ai-studio/text-generation/api-ref/TextGeneration/completion),
+[аутентификация](https://aistudio.yandex.ru/docs/ru/ai-studio/api-ref/authentication)), ноябрь 2026.
+
+**Противоречие в документации:** справочник у поля `tools` пишет, что оно «пока не
+поддерживается и будет проигнорировано», а руководство по вызову функций использует именно
+его. Перед боевым запуском проверьте на реальном ключе, что модель возвращает `toolCallList`.
+Если нет — модель будет отвечать без данных 1С, и это будет видно по пустым `sources`.
+
+### GigaChat (`gigachat`)
+
+REST API v1: `POST {LLM_BASE_URL}/chat/completions` (по умолчанию `https://api.giga.chat/v1`).
+
+- Токен доступа получается по `GIGACHAT_OAUTH_URL` (`Authorization: Basic <LLM_API_KEY>`,
+  `RqUID: <uuid4>`, тело `scope=<GIGACHAT_SCOPE>`), кэшируется до истечения
+  (`expires_at`, не дольше 30 минут, с запасом в минуту) и обновляется один раз при ответе 401.
+- Функции передаются в `functions` с `function_call: "auto"`; вызов приходит в
+  `message.function_call` вместе с `functions_state_id`, который возвращается в истории.
+  Результат — сообщение `role: function` с `content` в виде JSON-объекта в строке.
+- `temperature` у GigaChat строго больше 0: при `LLM_TEMPERATURE=0` поле не передаётся.
+- Если TLS-соединение с серверами Сбера не устанавливается, укажите корневой сертификат
+  НУЦ Минцифры в `LLM_CA_CERT_PATH`.
+
+Сверено со [спецификацией OpenAPI GigaChat API](https://developers.sber.ru/docs/files/openapi/gigachat/api.yml)
+и руководствами ([авторизация](https://developers.sber.ru/docs/ru/gigachat/api/authorization),
+[работа с функциями](https://developers.sber.ru/docs/ru/gigachat/api/function-calling)), ноябрь 2026.
+
+Оба провайдера проверены только против фейковых серверов, повторяющих документированный
+формат (`tests/providers.rs`); на реальных ключах не проверялись.
 
 ## Роли
 
@@ -219,6 +278,8 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   отсутствие секретов в файле базы;
 - `tests/api.rs` — интеграционный тест `POST /chat` и `GET /health` на реальном сервере;
 - `tests/openai.rs` — полный цикл через `OpenAiCompatible` против фейкового сервера;
+- `tests/providers.rs` — полный цикл через `YandexGpt` и `GigaChat` против фейковых серверов:
+  заголовки, формат истории, повторное использование и обновление токена GigaChat;
 - `tests/onec_http.rs` — `HttpOneC`: Basic-аутентификация, 401/404, таймаут;
 - модульные тесты в `src/` (валидатор схем, деньги, конфигурация, извлечение чисел и др.).
 
@@ -228,7 +289,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 src/
   config.rs            конфигурация из env, Secret
   error.rs             ошибки запуска
-  llm/                 LlmProvider, OpenAiCompatible, MockProvider, заготовки YandexGPT/GigaChat
+  llm/                 LlmProvider, OpenAiCompatible, YandexGpt, GigaChat, MockProvider
   onec/                OneCClient, MockOneC, HttpOneC, доменные типы
   tools/               реестр функций, валидатор JSON Schema, функции 1С
   auth/                роли, IdentityResolver, FileIdentityResolver
@@ -255,8 +316,9 @@ src/
 
 ## TODO
 
-- [ ] `YandexGpt`: сверить с актуальной документацией формат запросов, вызов функций и аутентификацию (`src/llm/yandex.rs`).
-- [ ] `GigaChat`: сверить получение токена, формат запросов и вызов функций (`src/llm/gigachat.rs`).
+- [ ] Проверить `YandexGpt` на реальном ключе, в первую очередь работу `tools` (см. противоречие в документации).
+- [ ] Проверить `GigaChat` на реальном ключе, в том числе TLS к `ngw.devices.sberbank.ru` и `api.giga.chat`.
+- [ ] YandexGPT: при необходимости добавить аутентификацию IAM-токеном с автообновлением (сейчас только API-ключ).
 - [ ] Согласовать контракт HTTP-сервиса 1С (`src/onec/http.rs`) и поправить пути/типы.
 - [ ] `IdentityResolver` для Битрикс24 и аутентификация запросов.
 - [ ] Хранилище диалогов вне памяти процесса, если нужно несколько экземпляров.
