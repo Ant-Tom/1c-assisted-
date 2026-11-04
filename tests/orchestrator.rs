@@ -273,6 +273,11 @@ async fn iteration_limit_is_enforced() {
         OrchestratorError::IterationLimit { limit: 3 }
     ));
     assert_eq!(h.llm.requests().len(), 3);
+    assert_eq!(
+        h.onec.calls(),
+        2,
+        "на последнем шаге результат не нужен, 1С не вызывается"
+    );
 }
 
 #[tokio::test]

@@ -39,6 +39,8 @@ pub enum ToolError {
     Timeout,
     #[error("результат слишком большой; уточни запрос (например, более точное название)")]
     ResultTooLarge,
+    #[error("вызов не выполнен: исчерпан лимит шагов обработки запроса")]
+    NotExecuted,
     #[error("данные не найдены: {0}")]
     NotFound(String),
     #[error("ошибка источника данных: {0}")]
@@ -56,6 +58,7 @@ impl ToolError {
             ToolError::TooManyCalls { .. } => "too_many_calls",
             ToolError::Timeout => "timeout",
             ToolError::ResultTooLarge => "result_too_large",
+            ToolError::NotExecuted => "not_executed",
             ToolError::NotFound(_) => "not_found",
             ToolError::Backend(_) => "backend_error",
         }

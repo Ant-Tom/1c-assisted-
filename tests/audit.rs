@@ -171,6 +171,11 @@ async fn failed_requests_are_audited() {
         .map(|r| r.status.as_str())
         .collect();
     assert_eq!(summaries, vec!["iteration_limit", "empty_message"]);
-    assert_eq!(rows.iter().filter(|r| r.function_name.is_some()).count(), 3);
+    let calls: Vec<_> = rows
+        .iter()
+        .filter(|r| r.function_name.is_some())
+        .map(|r| r.status.as_str())
+        .collect();
+    assert_eq!(calls, vec!["ok", "ok", "not_executed"]);
     assert!(rows[3].error.as_deref().unwrap().contains("3 итераций"));
 }

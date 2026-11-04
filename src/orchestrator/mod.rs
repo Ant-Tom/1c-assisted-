@@ -330,7 +330,8 @@ impl Orchestrator {
         run: &mut RunState,
     ) -> Result<String, OrchestratorError> {
         let specs = self.tools.specs_for(user.role);
-        for iteration in 0..self.settings.limits.max_iterations {
+        let max_iterations = self.settings.limits.max_iterations;
+        for iteration in 0..max_iterations {
             let reply = self.llm.chat(messages, &specs).await?;
             let calls = match reply {
                 Reply::Text(text) => {
@@ -345,8 +346,24 @@ impl Orchestrator {
                 Reply::ToolCalls(calls) if calls.is_empty() => {
                     return Err(LlmError::InvalidResponse("пустой список вызовов".into()).into());
                 }
-                Reply::ToolCalls(calls) => normalize_call_ids(calls, iteration),
+                Reply::ToolCalls(calls) => normalize_call_ids(calls, messages),
             };
+
+            // На последнем шаге модель уже не сможет использовать результат:
+            // в 1С не ходим, но вызовы фиксируем в журнале.
+            if iteration + 1 == max_iterations {
+                for call in &calls {
+                    self.record(
+                        run,
+                        call,
+                        Err(&ToolError::NotExecuted),
+                        0,
+                        Duration::ZERO,
+                        request_id,
+                    );
+                }
+                break;
+            }
 
             tracing::debug!(%request_id, iteration, calls = calls.len(), "модель запросила вызовы");
             messages.push(Message::assistant_tool_calls(calls.clone()));
@@ -480,16 +497,21 @@ fn saturating_i64(v: u128) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
-/// Некоторые серверы не присылают id вызова или повторяют его: делаем id уникальными,
-/// иначе результаты нельзя однозначно сопоставить вызовам.
-fn normalize_call_ids(calls: Vec<ToolCall>, iteration: usize) -> Vec<ToolCall> {
-    let mut seen = HashSet::new();
+/// Делает id вызовов уникальными в пределах всего диалога.
+///
+/// Некоторые провайдеры не присылают id (YandexGPT — никогда, GigaChat — не всегда)
+/// или повторяют его. Провайдеры сопоставляют результаты с вызовами по id во всей истории,
+/// поэтому повтор id между вопросами одного диалога перепутал бы вызовы и результаты.
+fn normalize_call_ids(calls: Vec<ToolCall>, history: &[Message]) -> Vec<ToolCall> {
+    let mut seen: HashSet<String> = history
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().map(|c| c.id.clone()))
+        .collect();
     calls
         .into_iter()
-        .enumerate()
-        .map(|(i, mut call)| {
+        .map(|mut call| {
             if call.id.trim().is_empty() || !seen.insert(call.id.clone()) {
-                call.id = format!("call_{iteration}_{i}");
+                call.id = format!("call_{}", Uuid::new_v4().simple());
                 seen.insert(call.id.clone());
             }
             call
@@ -531,17 +553,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn call_ids_are_made_unique() {
+    fn call_ids_are_unique_within_conversation() {
+        let history = vec![
+            Message::user("1"),
+            Message::assistant_tool_calls(vec![ToolCall::raw("old", "a", "{}")]),
+            Message::tool_result("old", "{}"),
+        ];
         let calls = vec![
             ToolCall::raw("", "a", "{}"),
             ToolCall::raw("x", "b", "{}"),
             ToolCall::raw("x", "c", "{}"),
+            ToolCall::raw("old", "d", "{}"),
         ];
-        let ids: Vec<_> = normalize_call_ids(calls, 2)
+        let ids: Vec<_> = normalize_call_ids(calls, &history)
             .into_iter()
             .map(|c| c.id)
             .collect();
-        assert_eq!(ids, vec!["call_2_0", "x", "call_2_2"]);
+        assert_eq!(ids[1], "x", "уникальный id сервера сохраняется");
+        assert!(ids[0].starts_with("call_"));
+        assert!(ids[2].starts_with("call_"));
+        assert!(
+            ids[3].starts_with("call_"),
+            "id из истории не переиспользуется"
+        );
+        let unique: HashSet<&str> = ids
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once("old"))
+            .collect();
+        assert_eq!(unique.len(), 5);
     }
 
     #[test]

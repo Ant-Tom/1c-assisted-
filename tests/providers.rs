@@ -31,7 +31,7 @@ async fn serve(app: Router) -> String {
     format!("http://{addr}")
 }
 
-async fn ask(llm: Arc<dyn LlmProvider>, message: &str) -> ChatResponse {
+fn orchestrator(llm: Arc<dyn LlmProvider>) -> Orchestrator {
     let tools = Arc::new(onec_registry(Arc::new(MockOneC::new())).unwrap());
     Orchestrator::new(
         llm,
@@ -39,16 +39,44 @@ async fn ask(llm: Arc<dyn LlmProvider>, message: &str) -> ChatResponse {
         AuditLog::open_in_memory().unwrap(),
         OrchestratorSettings::default(),
     )
-    .handle(ChatRequest {
+}
+
+async fn ask_in(orch: &Orchestrator, message: &str, conversation_id: Option<&str>) -> ChatResponse {
+    orch.handle(ChatRequest {
         user: UserIdentity {
             user_id: "u".into(),
             role: Role::Accountant,
         },
         message: message.into(),
-        conversation_id: None,
+        conversation_id: conversation_id.map(str::to_owned),
     })
     .await
     .unwrap()
+}
+
+async fn ask(llm: Arc<dyn LlmProvider>, message: &str) -> ChatResponse {
+    ask_in(&orchestrator(llm), message, None).await
+}
+
+/// Проверяет, что результат функции относится именно к этой функции.
+fn assert_result_matches(function: &str, content: &str) {
+    let content: Value = serde_json::from_str(content).unwrap();
+    let key = match function {
+        "search_counterparty" => "candidates",
+        "get_counterparty_balance" => "balance",
+        other => panic!("неожиданная функция {other}"),
+    };
+    assert!(
+        content["data"].get(key).is_some(),
+        "результат {content} не от функции {function}"
+    );
+}
+
+const SALDO_TEXT: &str = "Сальдо с АО «Вектор» на 2026-11-01: 0.00 RUB.";
+const FOUND_TEXT: &str = "Нашёл АО «Вектор», ИНН 7803456789.";
+
+fn wants_saldo(text: &str) -> bool {
+    text.to_lowercase().contains("сальдо")
 }
 
 // ---------------- YandexGPT ----------------
@@ -65,18 +93,30 @@ async fn yandex_completion(
     {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let has_results = body["messages"]
+    // Решение принимается по последнему сообщению, как это делала бы модель.
+    let last = body["messages"]
         .as_array()
-        .is_some_and(|m| m.iter().any(|m| m.get("toolResultList").is_some()));
+        .and_then(|m| m.last())
+        .cloned()
+        .unwrap_or_default();
     bodies.lock().unwrap().push(body);
-    let alternative = if has_results {
-        json!({"message": {"role": "assistant", "text": "Сальдо с АО «Вектор» на 2026-11-01: 0.00 RUB."},
-               "status": "ALTERNATIVE_STATUS_FINAL"})
+    let alternative = if let Some(results) = last.get("toolResultList") {
+        let name = &results["toolResults"][0]["functionResult"]["name"];
+        let text = if name == "get_counterparty_balance" {
+            SALDO_TEXT
+        } else {
+            FOUND_TEXT
+        };
+        json!({"message": {"role": "assistant", "text": text}, "status": "ALTERNATIVE_STATUS_FINAL"})
     } else {
-        json!({"message": {"role": "assistant", "toolCallList": {"toolCalls": [
-                  {"functionCall": {"name": "get_counterparty_balance",
-                                    "arguments": {"counterparty_id": "cp-003", "date": "2026-11-01"}}}
-               ]}},
+        let call = if wants_saldo(last["text"].as_str().unwrap_or_default()) {
+            json!({"name": "get_counterparty_balance",
+                   "arguments": {"counterparty_id": "cp-003", "date": "2026-11-01"}})
+        } else {
+            json!({"name": "search_counterparty", "arguments": {"query": "Вектор"}})
+        };
+        json!({"message": {"role": "assistant",
+                           "toolCallList": {"toolCalls": [{"functionCall": call}]}},
                "status": "ALTERNATIVE_STATUS_TOOL_CALLS"})
     };
     // Как в примере руководства: ответ в обёртке `result`.
@@ -87,21 +127,24 @@ async fn yandex_completion(
     }})))
 }
 
-#[tokio::test]
-async fn yandexgpt_full_loop() {
-    let bodies: Bodies = Arc::default();
+async fn yandex_llm(bodies: Bodies) -> Arc<YandexGpt> {
     let base = serve(
         Router::new()
             .route("/foundationModels/v1/completion", post(yandex_completion))
-            .with_state(bodies.clone()),
+            .with_state(bodies),
     )
     .await;
-
     let mut cfg = LlmConfig::for_backend(LlmBackend::YandexGpt);
     cfg.base_url = format!("{base}/foundationModels/v1");
     cfg.api_key = Some(Secret::new("ya-test-key"));
     cfg.folder_id = Some("b1gtest".into());
-    let llm = Arc::new(YandexGpt::new(&cfg).unwrap());
+    Arc::new(YandexGpt::new(&cfg).unwrap())
+}
+
+#[tokio::test]
+async fn yandexgpt_full_loop() {
+    let bodies: Bodies = Arc::default();
+    let llm = yandex_llm(bodies.clone()).await;
     assert_eq!(llm.model_name(), "gpt://b1gtest/yandexgpt/latest");
 
     let resp = ask(llm, "Сальдо с Вектором на 1 ноября").await;
@@ -121,9 +164,49 @@ async fn yandexgpt_full_loop() {
     assert_eq!(content["data"]["balance"], "0.00");
 }
 
+/// Регрессия: у YandexGPT нет id вызовов; во втором вопросе диалога история
+/// не должна путать результаты функций из разных вопросов.
+#[tokio::test]
+async fn yandexgpt_second_question_keeps_history_consistent() {
+    let bodies: Bodies = Arc::default();
+    let orch = orchestrator(yandex_llm(bodies.clone()).await);
+
+    let first = ask_in(&orch, "Найди Вектор", None).await;
+    assert!(first.answer.starts_with(FOUND_TEXT));
+    let second = ask_in(
+        &orch,
+        "А какое сальдо на 1 ноября?",
+        Some(&first.conversation_id),
+    )
+    .await;
+    assert!(second.answer.starts_with(SALDO_TEXT));
+
+    let bodies = bodies.lock().unwrap();
+    let msgs = bodies.last().unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let mut pairs = 0;
+    for (i, m) in msgs.iter().enumerate() {
+        let Some(calls) = m.get("toolCallList") else {
+            continue;
+        };
+        let call = &calls["toolCalls"][0]["functionCall"];
+        let result = &msgs[i + 1]["toolResultList"]["toolResults"][0]["functionResult"];
+        assert_eq!(result["name"], call["name"], "имя результата = имя вызова");
+        assert_result_matches(
+            call["name"].as_str().unwrap(),
+            result["content"].as_str().unwrap(),
+        );
+        pairs += 1;
+    }
+    assert_eq!(pairs, 2, "в истории оба вызова: поиск и сальдо");
+}
+
 // ---------------- GigaChat ----------------
 
 const STATE_ID: &str = "77d3fb14-457a-46ba-937e-8d856156d003";
+const STATE_ID_2: &str = "6f0b1291-c7f3-43c6-bb2e-9f3efb2dc98e";
 
 #[derive(Default)]
 struct GigaState {
@@ -177,20 +260,38 @@ async fn giga_chat(
     if bearer != latest || s.revoked.as_deref() == Some(bearer) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let has_result = body["messages"]
+    let last = body["messages"]
         .as_array()
-        .is_some_and(|m| m.iter().any(|m| m["role"] == "function"));
+        .and_then(|m| m.last())
+        .cloned()
+        .unwrap_or_default();
     s.chat_bodies.push(body);
-    let message = if has_result {
-        json!({"role": "assistant", "content": "Нашёл АО «Вектор», ИНН 7803456789."})
+    // Как в примерах документации: `function_call` без `id`.
+    let (message, finish_reason) = if last["role"] == "function" {
+        let text = if last["name"] == "get_counterparty_balance" {
+            SALDO_TEXT
+        } else {
+            FOUND_TEXT
+        };
+        (json!({"role": "assistant", "content": text}), "stop")
+    } else if wants_saldo(last["content"].as_str().unwrap_or_default()) {
+        (
+            json!({"role": "assistant", "content": "",
+                   "function_call": {"name": "get_counterparty_balance",
+                                     "arguments": {"counterparty_id": "cp-003", "date": "2026-11-01"}},
+                   "functions_state_id": STATE_ID_2}),
+            "function_call",
+        )
     } else {
-        json!({"role": "assistant", "content": "",
-               "function_call": {"name": "search_counterparty", "arguments": {"query": "Вектор"}},
-               "functions_state_id": STATE_ID})
+        (
+            json!({"role": "assistant", "content": "",
+                   "function_call": {"name": "search_counterparty", "arguments": {"query": "Вектор"}},
+                   "functions_state_id": STATE_ID}),
+            "function_call",
+        )
     };
     Ok(Json(json!({
-        "choices": [{"message": message, "index": 0,
-                     "finish_reason": if has_result { "stop" } else { "function_call" }}],
+        "choices": [{"message": message, "index": 0, "finish_reason": finish_reason}],
         "created": 1, "model": "GigaChat-2-Pro:test", "object": "chat.completion"
     })))
 }
@@ -267,4 +368,44 @@ async fn gigachat_wrong_key_is_typed_error() {
         .unwrap_err();
     assert!(err.to_string().contains("401"), "{err}");
     assert!(!err.to_string().contains("wrong"));
+}
+
+/// Регрессия: GigaChat не прислал `function_call.id`; во втором вопросе диалога
+/// каждый вызов должен идти со своим результатом и своим `functions_state_id`.
+#[tokio::test]
+async fn gigachat_second_question_keeps_history_consistent() {
+    let state: Giga = Arc::default();
+    let cfg = giga_server(state.clone()).await;
+    let orch = orchestrator(Arc::new(GigaChat::new(&cfg).unwrap()));
+
+    let first = ask_in(&orch, "Найди Вектор", None).await;
+    assert!(first.answer.starts_with(FOUND_TEXT));
+    let second = ask_in(
+        &orch,
+        "А какое сальдо на 1 ноября?",
+        Some(&first.conversation_id),
+    )
+    .await;
+    assert!(second.answer.starts_with(SALDO_TEXT));
+
+    let s = state.lock().unwrap();
+    let msgs = s.chat_bodies.last().unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let mut states = Vec::new();
+    for (i, m) in msgs.iter().enumerate() {
+        let Some(call) = m.get("function_call") else {
+            continue;
+        };
+        let result = &msgs[i + 1];
+        assert_eq!(result["role"], "function");
+        assert_eq!(result["name"], call["name"], "имя результата = имя вызова");
+        assert_result_matches(
+            call["name"].as_str().unwrap(),
+            result["content"].as_str().unwrap(),
+        );
+        states.push(m["functions_state_id"].as_str().unwrap().to_string());
+    }
+    assert_eq!(states, vec![STATE_ID, STATE_ID_2]);
 }

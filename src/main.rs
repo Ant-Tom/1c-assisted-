@@ -35,17 +35,13 @@ async fn run() -> Result<(), AppError> {
 
     let identity = Arc::new(FileIdentityResolver::from_file(&config.users_file)?);
 
+    for warning in config.startup_warnings() {
+        tracing::warn!("{warning}");
+    }
+
     let onec: Arc<dyn OneCClient> = match config.onec.backend {
-        OneCBackend::Mock => {
-            tracing::warn!("ONEC_BACKEND=mock: ответы строятся на тестовых данных");
-            Arc::new(MockOneC::new())
-        }
-        OneCBackend::Http => {
-            if config.onec.password.is_empty() {
-                tracing::warn!("ONEC_PASSWORD не задан");
-            }
-            Arc::new(HttpOneC::new(&config.onec)?)
-        }
+        OneCBackend::Mock => Arc::new(MockOneC::new()),
+        OneCBackend::Http => Arc::new(HttpOneC::new(&config.onec)?),
     };
 
     let llm: Arc<dyn LlmProvider> = match config.llm.backend {

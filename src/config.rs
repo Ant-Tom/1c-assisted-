@@ -282,6 +282,34 @@ impl Config {
         })
     }
 
+    /// Предупреждения о небезопасной или тестовой конфигурации; выводятся при старте.
+    pub fn startup_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        match self.onec.backend {
+            OneCBackend::Mock => {
+                out.push("ONEC_BACKEND=mock: ответы строятся на тестовых данных".to_string());
+            }
+            OneCBackend::Http => {
+                if self.onec.password.is_empty() {
+                    out.push("ONEC_PASSWORD не задан".to_string());
+                } else if self
+                    .onec
+                    .base_url
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("http://")
+                {
+                    out.push(
+                        "ONEC_BASE_URL использует http://: пароль 1С (Basic) передаётся \
+                         открытым текстом; используйте https://"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        out
+    }
+
     /// Все непустые секреты конфигурации: журнал вырезает их из текста перед записью.
     pub fn secrets(&self) -> Vec<Secret> {
         let mut out = Vec::new();
@@ -482,6 +510,82 @@ mod tests {
             ("GIGACHAT_SCOPE", "ADMIN")
         ])
         .is_err());
+    }
+
+    /// Пары ключ=значение из .env.example (без закомментированных строк).
+    fn env_example() -> HashMap<String, String> {
+        include_str!("../.env.example")
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn env_example_keeps_provider_defaults() {
+        let base = env_example();
+        let load = |extra: &[(&str, &str)]| {
+            let mut map = base.clone();
+            for (k, v) in extra {
+                map.insert(k.to_string(), v.to_string());
+            }
+            Config::from_lookup(|k| map.get(k).cloned()).unwrap()
+        };
+
+        let local = load(&[]);
+        assert_eq!(local.llm.base_url, "http://127.0.0.1:8080/v1");
+
+        let giga = load(&[("LLM_BACKEND", "gigachat"), ("LLM_API_KEY", "k")]);
+        assert_eq!(giga.llm.base_url, "https://api.giga.chat/v1");
+        assert_eq!(giga.llm.model, "GigaChat-2-Pro");
+
+        let ya = load(&[
+            ("LLM_BACKEND", "yandexgpt"),
+            ("LLM_API_KEY", "k"),
+            ("LLM_FOLDER_ID", "b1g"),
+        ]);
+        assert!(ya
+            .llm
+            .base_url
+            .starts_with("https://ai.api.cloud.yandex.net/"));
+        assert_eq!(ya.llm.model, "yandexgpt/latest");
+
+        let onec = load(&[("ONEC_BACKEND", "http"), ("ONEC_PASSWORD", "p")]);
+        assert!(onec.onec.base_url.starts_with("https://"));
+    }
+
+    #[test]
+    fn warns_about_plain_http_basic_auth() {
+        let insecure = config_from(&[
+            ("ONEC_BACKEND", "http"),
+            ("ONEC_BASE_URL", "HTTP://1c.local/base"),
+            ("ONEC_PASSWORD", "p"),
+        ])
+        .unwrap();
+        assert!(insecure
+            .startup_warnings()
+            .iter()
+            .any(|w| w.contains("открытым текстом")));
+
+        let secure = config_from(&[
+            ("ONEC_BACKEND", "http"),
+            ("ONEC_BASE_URL", "https://1c.local/base"),
+            ("ONEC_PASSWORD", "p"),
+        ])
+        .unwrap();
+        assert!(secure.startup_warnings().is_empty());
+
+        let no_password = config_from(&[
+            ("ONEC_BACKEND", "http"),
+            ("ONEC_BASE_URL", "http://1c.local/base"),
+        ])
+        .unwrap();
+        assert_eq!(
+            no_password.startup_warnings(),
+            vec!["ONEC_PASSWORD не задан"]
+        );
     }
 
     #[test]
