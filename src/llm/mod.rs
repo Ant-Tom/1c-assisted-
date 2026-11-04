@@ -6,9 +6,11 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub mod gigachat;
+pub mod mock;
 pub mod yandex;
 
 pub use gigachat::GigaChat;
+pub use mock::{MockProvider, MockStep};
 pub use yandex::YandexGpt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -7,4 +7,5 @@ pub mod config;
 pub mod error;
 pub mod llm;
 pub mod onec;
+pub mod orchestrator;
 pub mod tools;

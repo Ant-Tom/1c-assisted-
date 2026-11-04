@@ -37,6 +37,8 @@ pub enum ToolError {
     TooManyCalls { limit: usize },
     #[error("1С не ответила за отведённое время")]
     Timeout,
+    #[error("результат слишком большой; уточни запрос (например, более точное название)")]
+    ResultTooLarge,
     #[error("данные не найдены: {0}")]
     NotFound(String),
     #[error("ошибка источника данных: {0}")]
@@ -53,6 +55,7 @@ impl ToolError {
             ToolError::AmbiguousCounterparty => "ambiguous_counterparty",
             ToolError::TooManyCalls { .. } => "too_many_calls",
             ToolError::Timeout => "timeout",
+            ToolError::ResultTooLarge => "result_too_large",
             ToolError::NotFound(_) => "not_found",
             ToolError::Backend(_) => "backend_error",
         }
